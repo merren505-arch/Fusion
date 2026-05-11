@@ -4545,6 +4545,14 @@ class DeweaverEngine
             return;
         }
 
+        // Starg/Starg_S: pops 1 (value), pushes 0 → replace with pop
+        if (op == OpCodes.Starg || op == OpCodes.Starg_S)
+        {
+            il.Replace(instr, il.Create(OpCodes.Pop));
+            _stackNeutralReplacements++;
+            return;
+        }
+
         // For any other instruction, compute stack delta generically
         var (pops2, pushes2) = GetInstructionStackDelta(instr);
         var fallbackReplacements = new List<Instruction>();
