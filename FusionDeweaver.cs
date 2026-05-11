@@ -443,13 +443,57 @@ class DeweaverEngine
 
     private void ProcessRpcWeavingForType(TypeDefinition type)
     {
-        // Remove @Invoker methods
+        // Collect @Invoker methods before removing them, so we can redirect ldftn references
         var invokers = type.Methods.Where(m => m.Name.Contains("@Invoker")).ToList();
+        
+        // Build a map of invoker method names to their original RPC method names
+        var invokerMap = new Dictionary<string, string>();
+        foreach (var invoker in invokers)
+        {
+            // Extract original RPC name from invoker name (e.g., "MyRpc@Invoker" -> "MyRpc")
+            string originalRpcName = invoker.Name.Split('@')[0];
+            invokerMap[invoker.Name] = originalRpcName;
+        }
+
+        // Remove @Invoker methods
         foreach (var invoker in invokers)
         {
             type.Methods.Remove(invoker);
             _removedInvokerMethods++;
             Console.WriteLine($"  Removed invoker: {type.Name}::{invoker.Name}");
+        }
+
+        // Fix CS0103: Redirect any ldftn instructions that pointed to removed @Invoker methods
+        // This must happen BEFORE we remove the invoker methods entirely from memory
+        // but AFTER we've collected their names for the mapping
+        foreach (var otherMethod in type.Methods.Where(m => m.Body != null).ToList())
+        {
+            try
+            {
+                var il = otherMethod.Body.GetILProcessor();
+                var instructions = otherMethod.Body.Instructions;
+                
+                for (int i = 0; i < instructions.Count; i++)
+                {
+                    var instr = instructions[i];
+                    
+                    if (instr.OpCode == OpCodes.Ldftn && instr.Operand is MethodReference targetMr)
+                    {
+                        // Check if this ldftn points to a removed @Invoker
+                        if (targetMr.Name.Contains("@Invoker") && invokerMap.ContainsKey(targetMr.Name))
+                        {
+                            string originalRpcName = invokerMap[targetMr.Name];
+                            var originalMethod = type.Methods.FirstOrDefault(m => m.Name == originalRpcName);
+                            if (originalMethod != null)
+                            {
+                                instr.Operand = _module.ImportReference(originalMethod);
+                                Console.WriteLine($"  Redirected ldftn in {otherMethod.Name}: {targetMr.Name} -> {originalRpcName}");
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
         }
 
         // Remove [NetworkRpcWeavedInvokerAttribute] and [NetworkRpcStaticWeavedInvokerAttribute]
@@ -802,7 +846,24 @@ class DeweaverEngine
 
         foreach (var prop in networkedProps)
         {
-            var backingName = $"<{prop.Name}>k__BackingField";
+            // De-obfuscate backing field name: strip C# special characters from <PropName>k__BackingField
+            // Convert to _propName if not taken, otherwise use standard k__BackingField with [CompilerGenerated]
+            var obfuscatedName = $"<{prop.Name}>k__BackingField";
+            var normalizedName = $"_{prop.Name}";
+            
+            // Check if normalized name is already taken
+            string backingName;
+            if (type.Fields.Any(f => f.Name == normalizedName))
+            {
+                // Use standard k__BackingField pattern but ensure [CompilerGenerated] is applied
+                backingName = obfuscatedName;
+            }
+            else
+            {
+                // Prefer cleaner _propName format
+                backingName = normalizedName;
+            }
+            
             if (type.Fields.Any(f => f.Name == backingName))
                 continue;
 
@@ -1640,6 +1701,35 @@ class DeweaverEngine
 
             _revertedStringPropTypes++;
             Console.WriteLine($"    Reverted property type to string: {type.Name}.{prop.Name}");
+        }
+
+        // Fix CS0030: Scan all method bodies for Castclass/Isinst to NetworkString types
+        // and replace them with String equivalents
+        foreach (var method in type.Methods.Where(m => m.Body != null).ToList())
+        {
+            try
+            {
+                var il = method.Body.GetILProcessor();
+                var instructions = method.Body.Instructions;
+                
+                for (int i = 0; i < instructions.Count; i++)
+                {
+                    var instr = instructions[i];
+                    
+                    // Check for Castclass or Isinst to NetworkString<Fusion._N>
+                    if ((instr.OpCode == OpCodes.Castclass || instr.OpCode == OpCodes.Isinst) &&
+                        instr.Operand is TypeReference tr &&
+                        tr.Name.StartsWith("NetworkString`") &&
+                        tr is GenericInstanceType git &&
+                        git.GenericArguments.Any(ga => IsFusionCapacityTypeReference(ga)))
+                    {
+                        // Replace with System.String
+                        instr.Operand = _module.TypeSystem.String;
+                        Console.WriteLine($"    Fixed {instr.OpCode} instruction in {method.Name}: NetworkString -> String");
+                    }
+                }
+            }
+            catch { }
         }
     }
 
@@ -4176,6 +4266,7 @@ class DeweaverEngine
     private void FixStaleFieldReferencesInMethodBodies(TypeDefinition type, FieldDefinition changedField)
     {
         var freshFieldRef = _module.ImportReference(changedField);
+        bool isRefType = !changedField.FieldType.IsValueType;
 
         foreach (var method in type.Methods.ToList())
         {
@@ -4191,47 +4282,51 @@ class DeweaverEngine
                 {
                     var instr = instructions[i];
 
-                    // Fix Ldflda + Initobj pattern for fields that changed from value type to reference type.
-                    // Original pattern (3 instructions): Ldarg_0; Ldflda field; Initobj type
-                    // This initializes a value-type field to its default. But after changing to reference type,
-                    // Ldflda on a string field produces a managed pointer (Ref), causing "Expected O, but got Ref".
-                    // Initobj on a reference type is also invalid.
+                    // Fix CS0037: If field is now string (RefType), Ldflda + Initobj is ILLEGAL
+                    // Original pattern: Ldarg_0; Ldflda field; Initobj type
+                    // After reversion: Ldflda on string produces managed pointer (Ref), causing "Expected O, but got Ref"
                     // Replace: Ldflda field; Initobj type → Ldnull; Stfld field
-                    // (The preceding Ldarg_0 stays as-is)
-                    if (instr.OpCode == OpCodes.Ldflda && IsFieldRefMatch(instr.Operand, changedField))
+                    if (isRefType && instr.OpCode == OpCodes.Ldflda && IsFieldRefMatch(instr.Operand, changedField))
                     {
-                        // Check if the next instruction is Initobj — this is the ONLY safe pattern to transform.
-                        // Ldflda + Initobj: initializes a value-type field to default. After changing to
-                        // reference type, Ldflda produces a managed pointer and Initobj on a reference type
-                        // is invalid. Replace with Ldnull + Stfld.
                         if (i + 1 < instructions.Count && instructions[i + 1].OpCode == OpCodes.Initobj)
                         {
                             var ldnullInstr = il.Create(OpCodes.Ldnull);
                             var stfldInstr = il.Create(OpCodes.Stfld, freshFieldRef);
 
-                            // Replace Ldflda with Ldnull
                             il.Replace(instr, ldnullInstr);
-                            // Replace Initobj with Stfld
                             il.Replace(instructions[i + 1], stfldInstr);
 
                             modified = true;
                             i += 1; // Skip past the Stfld we just created
                             continue;
                         }
-
-                        // Standalone Ldflda (not followed by Initobj): DO NOT replace with Ldfld.
-                        // Ldflda on a reference-type field is valid IL — it pushes a managed pointer
-                        // to the storage location (e.g., for passing as ref/out parameter).
-                        // Replacing with Ldfld would change the stack type from & to O, breaking
-                        // any subsequent instruction that expects a pointer (call with ref param, etc.)
-                        // Instead, just update the FieldReference operand to the fresh one.
-                        if (instr.Operand is FieldReference ldfldaFr && !ReferenceEquals(ldfldaFr, freshFieldRef))
+                    }
+                    
+                    // Fix CS0571: Remove explicit calls to implicit conversion operators
+                    // The weaver often explicitly calls op_Implicit for NetworkString or ReadOnlySpan conversions.
+                    // Since we have reverted the underlying types to match, these calls are now identity conversions.
+                    // Replace the Call instruction with a Nop to allow decompiler to see direct assignment.
+                    if (instr.OpCode == OpCodes.Call && instr.Operand is MethodReference mr && mr.Name == "op_Implicit")
+                    {
+                        var declaringTypeName = mr.DeclaringType?.Name ?? "";
+                        if (declaringTypeName.Contains("NetworkString") || declaringTypeName.Contains("ReadOnlySpan"))
                         {
-                            var newLdflda = il.Create(OpCodes.Ldflda, freshFieldRef);
-                            il.Replace(instr, newLdflda);
+                            il.Replace(instr, il.Create(OpCodes.Nop));
                             modified = true;
                         }
-                        continue;
+                    }
+                    
+                    // Fix CS0103: Redirect ghost function pointers (__ldftn artifacts)
+                    // Scan for ldftn instructions that reference @Invoker methods and redirect to original RPC method
+                    if (instr.OpCode == OpCodes.Ldftn && instr.Operand is MethodReference targetMr && targetMr.Name.Contains("@Invoker"))
+                    {
+                        string originalRpcName = targetMr.Name.Split('@')[0];
+                        var originalMethod = type.Methods.FirstOrDefault(m => m.Name == originalRpcName);
+                        if (originalMethod != null)
+                        {
+                            instr.Operand = _module.ImportReference(originalMethod);
+                            modified = true;
+                        }
                     }
 
                     // Fix any Stfld/Ldfld with stale FieldReference operands
@@ -4795,6 +4890,54 @@ class DeweaverEngine
             }
         }
 
+        // Fix CS0201: Look for "Stack Litter" - Ldarg_0 followed immediately by another Ldarg_0 or Ldloc
+        // without a consuming Stfld or Call. This is leftover from weaver removal.
+        for (int i = 0; i < instructions.Count - 1; i++)
+        {
+            var instr1 = instructions[i];
+            var instr2 = instructions[i + 1];
+
+            // Pattern: Ldarg_0 (or Ldloc) followed by another Ldarg_0/Ldloc without consumption
+            bool isLdarg0 = instr1.OpCode == OpCodes.Ldarg_0;
+            bool isLdargOrLdloc = instr2.OpCode == OpCodes.Ldarg_0 || 
+                                  instr2.OpCode == OpCodes.Ldarg || 
+                                  instr2.OpCode == OpCodes.Ldloc || 
+                                  instr2.OpCode == OpCodes.Ldloc_S;
+
+            if (isLdarg0 && isLdargOrLdloc)
+            {
+                // Check if there's a consuming instruction after instr2
+                bool hasConsumer = false;
+                for (int j = i + 2; j < Math.Min(i + 5, instructions.Count); j++)
+                {
+                    var nextInstr = instructions[j];
+                    if (nextInstr.OpCode == OpCodes.Stfld || 
+                        nextInstr.OpCode == OpCodes.Call || 
+                        nextInstr.OpCode == OpCodes.Callvirt ||
+                        nextInstr.OpCode == OpCodes.Newobj)
+                    {
+                        hasConsumer = true;
+                        break;
+                    }
+                    // If we hit a branch or ret before a consumer, it's litter
+                    if (nextInstr.OpCode == OpCodes.Ret || 
+                        nextInstr.OpCode == OpCodes.Br || 
+                        nextInstr.OpCode == OpCodes.Br_S ||
+                        nextInstr.OpCode == OpCodes.Leave ||
+                        nextInstr.OpCode == OpCodes.Leave_S)
+                    {
+                        break;
+                    }
+                }
+
+                if (!hasConsumer && !branchTargets.Contains(instr1))
+                {
+                    toRemove.Add(instr1);
+                    cleaned++;
+                }
+            }
+        }
+
         if (toRemove.Count > 0)
         {
             foreach (var instr in toRemove.ToList())
@@ -4988,6 +5131,7 @@ class DeweaverEngine
     /// <summary>
     /// Aggressive dead code cleanup for methods with stack issues.
     /// Removes push+pop pairs where the push has no side effects.
+    /// Also handles "Stack Litter" - Ldarg_0 followed by another Ldarg_0 or Ldloc without a consuming Stfld or Call.
     /// </summary>
     private int AggressiveStackCleanup(MethodDefinition method)
     {
@@ -5036,6 +5180,60 @@ class DeweaverEngine
                         break;
                     }
                     catch { }
+                }
+            }
+
+            // Fix CS0201: Look for "Stack Litter" - Ldarg_0 followed immediately by another Ldarg_0 or Ldloc
+            // without a consuming Stfld or Call. This is leftover from weaver removal.
+            for (int i = 0; i < instructions.Count - 1; i++)
+            {
+                var instr1 = instructions[i];
+                var instr2 = instructions[i + 1];
+
+                // Pattern: Ldarg_0 (or Ldloc) followed by another Ldarg_0/Ldloc without consumption
+                bool isLdarg0 = instr1.OpCode == OpCodes.Ldarg_0;
+                bool isLdargOrLdloc = instr2.OpCode == OpCodes.Ldarg_0 || 
+                                      instr2.OpCode == OpCodes.Ldarg || 
+                                      instr2.OpCode == OpCodes.Ldloc || 
+                                      instr2.OpCode == OpCodes.Ldloc_S;
+
+                if (isLdarg0 && isLdargOrLdloc)
+                {
+                    // Check if there's a consuming instruction after instr2
+                    bool hasConsumer = false;
+                    for (int j = i + 2; j < Math.Min(i + 5, instructions.Count); j++)
+                    {
+                        var nextInstr = instructions[j];
+                        if (nextInstr.OpCode == OpCodes.Stfld || 
+                            nextInstr.OpCode == OpCodes.Call || 
+                            nextInstr.OpCode == OpCodes.Callvirt ||
+                            nextInstr.OpCode == OpCodes.Newobj)
+                        {
+                            hasConsumer = true;
+                            break;
+                        }
+                        // If we hit a branch or ret before a consumer, it's litter
+                        if (nextInstr.OpCode == OpCodes.Ret || 
+                            nextInstr.OpCode == OpCodes.Br || 
+                            nextInstr.OpCode == OpCodes.Br_S ||
+                            nextInstr.OpCode == OpCodes.Leave ||
+                            nextInstr.OpCode == OpCodes.Leave_S)
+                        {
+                            break;
+                        }
+                    }
+
+                    if (!hasConsumer && !branchTargets.Contains(instr1))
+                    {
+                        try
+                        {
+                            il.Remove(instr1);
+                            cleaned++;
+                            changed = true;
+                            break;
+                        }
+                        catch { }
+                    }
                 }
             }
         }
