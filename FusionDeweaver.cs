@@ -1032,20 +1032,67 @@ class DeweaverEngine
                 var backingField = type.Fields.FirstOrDefault(f => f.Name == backingName)
                                  ?? type.Fields.FirstOrDefault(f => f.Name == altBackingName);
 
-                // Check if this property has RetainIL=true - if so, preserve the original body
+                // Check if this property has RetainIL=true - if so, try to preserve the original body
                 bool isRetainIL = savedMeta?.RetainIL == true;
 
                 if (isRetainIL && backingField != null)
                 {
-                    // RetainIL: Only strip the weaver prologue (Ptr null check - already done above)
-                    // and weaver epilogue (state write-back). Keep the user's original IL intact.
-                    // The Ptr null check was already stripped by StripPtrNullCheck above.
-                    // Now strip any weaver-injected epilogue from setters.
+                    // RetainIL: The weaver is supposed to preserve the user's original property body.
+                    // Per Fusion.CodeGen.cs IsWeavableProperty (line 673-682), RetainIL=true means the weaver
+                    // should keep the original backing field and NOT obliterate the accessor bodies.
+                    // However, in practice, some Fusion versions or obfuscators may still modify the body.
+                    //
+                    // Strategy: Try StripWeaverEpilogue first. If it finds a backing field store
+                    // (meaning the original body is intact), preserve it. Otherwise, fall through to
+                    // normal restoration (create simple get/set with backing field).
                     StripWeaverEpilogue(prop.SetMethod, type, prop.Name, backingField);
-                    _retainILPropertiesPreserved++;
-                    Console.WriteLine($"    Preserved RetainIL property body: {prop.Name} (only stripped weaver prologue/epilogue)");
+
+                    // Check if the setter has a valid Stfld to the backing field (body was preserved)
+                    bool setterHasBackingFieldStore = prop.SetMethod?.Body != null &&
+                        prop.SetMethod.Body.Instructions.Any(i =>
+                            i.OpCode == OpCodes.Stfld &&
+                            i.Operand is FieldReference fr &&
+                            fr.Name == backingField.Name);
+
+                    if (!setterHasBackingFieldStore)
+                    {
+                        // Weaver obliterated the body despite RetainIL - fall through to normal restore.
+                        // This happens when the Fusion version doesn't fully support RetainIL,
+                        // or when the backing field was removed during weaving.
+                        Console.WriteLine($"    RetainIL property {prop.Name} body was obliterated, restoring normally");
+                    }
+                    else
+                    {
+                        // Body was preserved - check getter too
+                        bool getterHasBackingFieldLoad = prop.GetMethod?.Body != null &&
+                            prop.GetMethod.Body.Instructions.Any(i =>
+                                i.OpCode == OpCodes.Ldfld &&
+                                i.Operand is FieldReference fr &&
+                                fr.Name == backingField.Name);
+
+                        if (!getterHasBackingFieldLoad)
+                        {
+                            // Getter was also obliterated - restore it normally
+                            var fieldRef = _module.ImportReference(backingField);
+                            var il = prop.GetMethod.Body.GetILProcessor();
+                            prop.GetMethod.Body.Instructions.Clear();
+                            prop.GetMethod.Body.Variables.Clear();
+                            prop.GetMethod.Body.ExceptionHandlers.Clear();
+                            il.Emit(OpCodes.Ldarg_0);
+                            il.Emit(OpCodes.Ldfld, fieldRef);
+                            il.Emit(OpCodes.Ret);
+                            EnsureCompilerGeneratedOnMethod(prop.GetMethod);
+                            _restoredPropertyBodies++;
+                        }
+
+                        _retainILPropertiesPreserved++;
+                        Console.WriteLine($"    Preserved RetainIL property body: {prop.Name}");
+                        // Skip the else-if below since we handled it
+                        goto PropertyRestored;
+                    }
                 }
-                else if (backingField != null)
+
+                if (backingField != null)
                 {
                     var fieldRef = _module.ImportReference(backingField);
 
@@ -1085,6 +1132,7 @@ class DeweaverEngine
                     }
                 }
 
+            PropertyRestored:
                 Console.WriteLine($"    Restored property: {prop.Name}");
             }
             catch (Exception ex)
@@ -1244,6 +1292,12 @@ class DeweaverEngine
                 newAttr.Properties.Add(new CustomAttributeNamedArgument(
                     "Default",
                     new CustomAttributeArgument(_module.TypeSystem.String, savedMeta.Default)));
+            }
+            if (savedMeta.RetainIL)
+            {
+                newAttr.Properties.Add(new CustomAttributeNamedArgument(
+                    "RetainIL",
+                    new CustomAttributeArgument(_module.TypeSystem.Boolean, true)));
             }
         }
 
@@ -1670,27 +1724,27 @@ class DeweaverEngine
     /// from the start. If backing fields already exist (from an earlier step), their type
     /// is also reverted here. The ScrubOrphanedFusionCapacityTypeRefs method in Step 11
     /// serves as a defensive safety net for any fields that slip through.
+    ///
+    /// Per Fusion.CodeGen.cs lines 6519-6527, NetworkString&lt;N&gt; is a built-in blittable type.
+    /// The weaver does NOT change user-declared NetworkString&lt;N&gt; properties.
+    /// Only System.String properties get special weaver treatment (cache_ fields).
+    /// Therefore, we must ONLY revert when the [NetworkedWeavedStringAttribute] marker is present,
+    /// which the weaver adds specifically for string→blittable conversions.
     /// </summary>
     private void RevertStringPropertyTypes(TypeDefinition type)
     {
         foreach (var prop in type.Properties.ToList())
         {
-            // Detection method 1: Look for the specific marker the weaver leaves for string properties
+            // Only revert properties explicitly marked by the weaver's string transformation.
+            // Per Fusion.CodeGen.cs, NetworkString<N> is a built-in blittable type with NO special
+            // weaving. If the user explicitly wrote [Networked] NetworkString<_32>, that's their
+            // intended API. We must NOT revert it to string.
+            // The [NetworkedWeavedStringAttribute] marker is only present when the weaver transformed
+            // a System.String property into its blittable representation.
             var stringAttr = prop.CustomAttributes.FirstOrDefault(a =>
                 a.AttributeType.Name == "NetworkedWeavedStringAttribute");
 
-            // Detection method 2: Detect NetworkString<N> by type directly
-            // If the property type is NetworkString`1 with a Fusion._N generic argument,
-            // it was originally a string property that the weaver transformed.
-            bool isNetworkStringWithCapacityArg = false;
-            if (prop.PropertyType is GenericInstanceType git &&
-                git.ElementType.Name == "NetworkString`1" &&
-                git.GenericArguments.Any(ga => IsFusionCapacityTypeReference(ga)))
-            {
-                isNetworkStringWithCapacityArg = true;
-            }
-
-            if (stringAttr == null && !isNetworkStringWithCapacityArg) continue;
+            if (stringAttr == null) continue;
 
             // Revert type to System.String
             var stringType = _module.TypeSystem.String;
@@ -2320,11 +2374,12 @@ class DeweaverEngine
         // <initialization instructions>
         // <skipLabel>: ...
 
+        // Per Fusion.CodeGen.cs line 2384-2386, the isFirst parameter is ALWAYS Ldarg_1.
+        // Using broader matching (Ldarg_2, Ldarg_S, Ldarg_3) could match unrelated patterns.
+        // Restrict to Ldarg_1 only per truth source.
         for (int i = 0; i < instructions.Count - 2; i++)
         {
-            // Pattern: Ldarg_1/Ldarg_2 followed by Brfalse
-            if ((instructions[i].OpCode == OpCodes.Ldarg_1 || instructions[i].OpCode == OpCodes.Ldarg_2 ||
-                 instructions[i].OpCode == OpCodes.Ldarg_S || instructions[i].OpCode == OpCodes.Ldarg_3) &&
+            if (instructions[i].OpCode == OpCodes.Ldarg_1 &&
                 IsBrfalse(instructions[i + 1].OpCode) &&
                 instructions[i + 1].Operand is Instruction skipTarget)
             {
@@ -2735,6 +2790,29 @@ class DeweaverEngine
                 // This is tricky - for now just remove the call and let dead code elimination handle the args
                 _restoredCollectionInits++;
                 Console.WriteLine($"    Removed {mr3.Name} call in {type.Name}::{method.Name}");
+            }
+
+            // Pattern 5: Calls to NetworkBehaviour.MakeRef<T>() and NetworkBehaviour.MakePtr<T>()
+            // Per Fusion.CodeGen.cs IsMakeRefOrMakePtrCall (line 1635-1644), these are used
+            // for pointer/reference property initializers. They should be removed along with
+            // the following op_Implicit cast.
+            if (instr.OpCode == OpCodes.Call && instr.Operand is MethodReference mr5 &&
+                mr5.DeclaringType.Name == "NetworkBehaviour" &&
+                (mr5.Name == "MakeRef" || mr5.Name == "MakePtr"))
+            {
+                toRemove.Add(instr);
+                _restoredCollectionInits++;
+
+                // Also remove the following op_Implicit if present
+                if (i + 1 < instructions.Count &&
+                    instructions[i + 1].OpCode == OpCodes.Call &&
+                    instructions[i + 1].Operand is MethodReference implMr5 &&
+                    implMr5.Name == "op_Implicit")
+                {
+                    toRemove.Add(instructions[i + 1]);
+                }
+
+                Console.WriteLine($"    Removed MakeRef/MakePtr call in {type.Name}::{method.Name}");
             }
 
             // Pattern 4: Calls to NetworkBehaviourUtils.CopyFromNetworkArray/CopyFromNetworkList/CopyFromNetworkDictionary
@@ -4368,6 +4446,19 @@ class DeweaverEngine
                             i += 1; // Skip past the Stfld we just created
                             continue;
                         }
+                        // Also handle Ldflda + Conv_U (pointer conversion pattern)
+                        if (i + 1 < instructions.Count && instructions[i + 1].OpCode == OpCodes.Conv_U)
+                        {
+                            var ldnullInstr = il.Create(OpCodes.Ldnull);
+                            var stfldInstr = il.Create(OpCodes.Stfld, freshFieldRef);
+
+                            il.Replace(instr, ldnullInstr);
+                            il.Replace(instructions[i + 1], il.Create(OpCodes.Nop)); // Conv_U → Nop
+
+                            modified = true;
+                            i += 1;
+                            continue;
+                        }
                     }
                     
                     // Fix CS0571: Remove explicit calls to implicit conversion operators
@@ -4397,14 +4488,24 @@ class DeweaverEngine
                         }
                     }
 
-                    // Fix any Stfld/Ldfld with stale FieldReference operands
-                    if ((instr.OpCode == OpCodes.Stfld || instr.OpCode == OpCodes.Ldfld) &&
+                    // Fix any Stfld/Ldfld/Ldsfld/Stsfld with stale FieldReference operands
+                    // (handles both instance and static field references)
+                    if ((instr.OpCode == OpCodes.Stfld || instr.OpCode == OpCodes.Ldfld ||
+                         instr.OpCode == OpCodes.Ldsfld || instr.OpCode == OpCodes.Stsfld) &&
                         IsFieldRefMatch(instr.Operand, changedField) &&
                         instr.Operand is FieldReference fr && !ReferenceEquals(fr, freshFieldRef))
                     {
                         // Replace the stale operand with the fresh one
                         var newInstr = il.Create(instr.OpCode, freshFieldRef);
                         il.Replace(instr, newInstr);
+                        modified = true;
+                    }
+
+                    // Fix Ldflda/Ldsflda with stale references (for non-Initobj/non-Conv_U cases)
+                    if ((instr.OpCode == OpCodes.Ldflda || instr.OpCode == OpCodes.Ldsflda) &&
+                        IsFieldRefMatch(instr.Operand, changedField))
+                    {
+                        instr.Operand = freshFieldRef;
                         modified = true;
                     }
                 }
