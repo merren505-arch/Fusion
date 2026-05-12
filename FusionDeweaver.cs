@@ -95,7 +95,7 @@ class DeweaverEngine
     private readonly string _fusionDir;
     private AssemblyDefinition _asm = null!;
     private ModuleDefinition _module = null!;
-    private DefaultAssemblyResolver _resolver = null!;
+    private TolerantAssemblyResolver _resolver = null!;
 
     // Track newly created backing fields so we can reference them correctly
     private readonly Dictionary<string, FieldDefinition> _newBackingFields = new();
@@ -126,8 +126,7 @@ class DeweaverEngine
     private int _ensuredNetworkedAttrs;
     private int _removedPtrNullChecks;
     private int _preservedNetworkedMetadata;
-    private int _restoredCapacityAttrs;
-    private int _restoredAccuracyAttrs;
+
     private int _purgedCodeGenTypeRefs;
     private int _purgedCodeGenMemberRefs;
     private int _removedOnChangedRenderMethods;
@@ -186,7 +185,7 @@ class DeweaverEngine
     {
         Console.WriteLine($"[Deweaver] Loading assembly: {_inputPath}");
 
-        _resolver = new DefaultAssemblyResolver();
+        _resolver = new TolerantAssemblyResolver(new DefaultAssemblyResolver());
         _resolver.AddSearchDirectory(Path.GetDirectoryName(_inputPath));
         _resolver.AddSearchDirectory(_fusionDir);
         if (Directory.Exists(_fusionDir))
@@ -216,6 +215,10 @@ class DeweaverEngine
         RunStep("Step 1", Step1_RemoveAssemblyWeavedAttribute);
         RunStep("Step 2", Step2_RemoveRpcWeaving);
         RunStep("Step 3", Step3_RemoveNetworkBehaviourWeaving);
+        // Step 3b/3c: Migrate attributes and unwrap proxies for ALL types.
+        // Note: Step 3 already calls these for NetworkBehaviour types internally,
+        // but Steps 3b/3c also handle struct types (INetworkStruct) which Step 3 skips.
+        // ProcessNetworkBehaviourWeaving types are skipped here to avoid redundant work.
         RunStep("Step 3b", Step3b_MigrateAttributesFromWeaverFields);
         RunStep("Step 3c", Step3c_UnwrapUnityPropertyAttributeProxies);
         RunStep("Step 3d", Step3d_RecoverConstructorAssignments);
@@ -262,6 +265,7 @@ class DeweaverEngine
         }
 
         _asm.Dispose();
+        _resolver.Dispose();
 
         PrintStatistics();
     }
@@ -712,7 +716,7 @@ class DeweaverEngine
         Console.WriteLine("[Step 3] Removing NetworkBehaviour weaving...");
         foreach (var type in GetAllTypes())
         {
-            if (IsNetworkBehaviour(type) || IsSimulationBehaviour(type))
+            if (IsNetworkBehaviour(type))
             {
                 try
                 {
@@ -723,6 +727,15 @@ class DeweaverEngine
                 {
                     Console.WriteLine($"  WARNING: Failed to process NetworkBehaviour weaving for {type.FullName}: {ex.Message}");
                 }
+            }
+            else if (IsSimulationBehaviour(type))
+            {
+                // Per truth source Fusion.CodeGen.cs WeaveSimulation (line 1545-1548):
+                // WeaveSimulation ONLY calls WeaveRpcs(asm, type, allowInstanceRpcs: false).
+                // It does NOT do property weaving, CopyBackingFieldsToState, backing fields, etc.
+                // RPC restoration is already handled by Step 2, so nothing extra needed here.
+                // We still track it as processed to skip redundant work in Steps 3b/3c/3d.
+                _processedNetworkBehaviours.Add(type.FullName);
             }
         }
     }
@@ -933,12 +946,6 @@ class DeweaverEngine
                     savedMeta = ExtractNetworkedAttributeMeta(networkedAttr);
                 }
 
-                // Also extract [Capacity] and [Accuracy] from the property
-                var capacityAttr = prop.CustomAttributes.FirstOrDefault(a =>
-                    a.AttributeType.Name == "CapacityAttribute");
-                var accuracyAttr = prop.CustomAttributes.FirstOrDefault(a =>
-                    a.AttributeType.Name == "AccuracyAttribute");
-
                 // Remove NetworkedWeavedAttribute
                 RemoveCustomAttribute(prop, "NetworkedWeavedAttribute", ref _removedWeavedAttrs);
 
@@ -949,19 +956,12 @@ class DeweaverEngine
                 // Ensure [Networked] attribute exists with full metadata
                 EnsureNetworkedAttribute(prop, savedMeta);
 
-                // Ensure [Capacity] and [Accuracy] survive on the property
-                if (capacityAttr != null && !prop.CustomAttributes.Any(a => a.AttributeType.Name == "CapacityAttribute"))
-                {
-                    prop.CustomAttributes.Add(capacityAttr);
-                    _restoredCapacityAttrs++;
-                    Console.WriteLine($"    Restored [Capacity] on property: {prop.Name}");
-                }
-                if (accuracyAttr != null && !prop.CustomAttributes.Any(a => a.AttributeType.Name == "AccuracyAttribute"))
-                {
-                    prop.CustomAttributes.Add(accuracyAttr);
-                    _restoredAccuracyAttrs++;
-                    Console.WriteLine($"    Restored [Accuracy] on property: {prop.Name}");
-                }
+                // [Capacity] and [Accuracy] are preserved on the property by the weaver
+                // (per Fusion.CodeGen.cs VisitPropertyMovableAttributes lines 2078-2081, they
+                // are skipped during attribute migration to backing field).
+                // If they were moved to the field by an older Fusion 1 weaver, they will be
+                // migrated back by MigrateSpecificAttrIfOnFieldButNotProperty in
+                // MigrateAttributesFromWeaverFieldsToProperties (Step 3b).
 
                 // NetworkString/string backing field cleanup
                 // Per weaver source, the weaver generates cache_{prop.Name} fields of type System.String
@@ -1073,6 +1073,7 @@ class DeweaverEngine
                         if (!getterHasBackingFieldLoad)
                         {
                             // Getter was also obliterated - restore it normally
+                            if (prop.GetMethod?.Body == null) goto PropertyRestored;
                             var fieldRef = _module.ImportReference(backingField);
                             var il = prop.GetMethod.Body.GetILProcessor();
                             prop.GetMethod.Body.Instructions.Clear();
@@ -1097,7 +1098,7 @@ class DeweaverEngine
                     var fieldRef = _module.ImportReference(backingField);
 
                     // Restore getter to simple: return this.backingField;
-                    if (prop.GetMethod != null)
+                    if (prop.GetMethod != null && prop.GetMethod.Body != null)
                     {
                         var il = prop.GetMethod.Body.GetILProcessor();
                         prop.GetMethod.Body.Instructions.Clear();
@@ -1114,7 +1115,7 @@ class DeweaverEngine
                     }
 
                     // Restore setter to simple: this.backingField = value;
-                    if (prop.SetMethod != null)
+                    if (prop.SetMethod != null && prop.SetMethod.Body != null)
                     {
                         var il = prop.SetMethod.Body.GetILProcessor();
                         prop.SetMethod.Body.Instructions.Clear();
@@ -1984,7 +1985,12 @@ class DeweaverEngine
         Console.WriteLine("[Step 3b] Migrating attributes from weaver fields back to properties...");
         foreach (var type in GetAllTypes())
         {
-            if (IsNetworkBehaviour(type) || IsSimulationBehaviour(type))
+            // Skip types already processed in Step 3 (ProcessNetworkBehaviourWeaving)
+            // to avoid redundant attribute migration work.
+            if (_processedNetworkBehaviours.Contains(type.FullName))
+                continue;
+
+            if (IsNetworkBehaviour(type))
             {
                 try { MigrateAttributesFromWeaverFieldsToProperties(type); }
                 catch (Exception ex) { Console.WriteLine($"  WARNING: MigrateAttributes failed for {type.FullName}: {ex.Message}"); }
@@ -2028,8 +2034,12 @@ class DeweaverEngine
             var defaultField = type.Fields.FirstOrDefault(f => f.Name == defaultFieldName);
             if (defaultField == null) continue;
 
-            // Priority 2 vs 3: Only migrate from weaver-generated fields
-            bool isWeaverGenerated = SafeHasAttribute(defaultField, "WeaverGeneratedAttribute");
+            // Priority 2 vs 3: Only migrate from weaver-generated fields.
+            // Per Fusion.CodeGen.cs line 2501, the weaver adds [DefaultForPropertyAttribute].
+            // Fusion 1 weaver does NOT add [WeaverGeneratedAttribute] to _PropName fields,
+            // so we must check BOTH attributes to avoid losing user attributes like [Header]/[Tooltip].
+            bool isWeaverGenerated = SafeHasAttribute(defaultField, "WeaverGeneratedAttribute") ||
+                                     SafeHasAttribute(defaultField, "DefaultForPropertyAttribute");
 
             if (!isWeaverGenerated)
             {
@@ -2180,7 +2190,15 @@ class DeweaverEngine
         Console.WriteLine("[Step 3c] Unwrapping UnityPropertyAttributeProxy attributes...");
         foreach (var type in GetAllTypes())
         {
-            if (IsNetworkBehaviour(type) || IsSimulationBehaviour(type))
+            // Skip types already processed in Step 3 (ProcessNetworkBehaviourWeaving)
+            if (_processedNetworkBehaviours.Contains(type.FullName))
+            {
+                // Still need to handle struct types though
+                if (!ImplementsInterface(type, "INetworkStruct") && !ImplementsInterface(type, "INetworkInput"))
+                    continue;
+            }
+
+            if (IsNetworkBehaviour(type))
             {
                 try { UnwrapProxyAttributesOnProperties(type); }
                 catch (Exception ex) { Console.WriteLine($"  WARNING: UnwrapProxyAttributes failed for {type.FullName}: {ex.Message}"); }
@@ -2336,7 +2354,7 @@ class DeweaverEngine
 
         foreach (var type in GetAllTypes())
         {
-            if (!IsNetworkBehaviour(type) && !IsSimulationBehaviour(type)) continue;
+            if (!IsNetworkBehaviour(type)) continue;
 
             try
             {
@@ -2462,7 +2480,10 @@ class DeweaverEngine
         {
             var defaultFieldName = $"_{prop.Name}";
             var backingFieldName = $"<{prop.Name}>k__BackingField";
-            var backingField = type.Fields.FirstOrDefault(f => f.Name == backingFieldName);
+            var camelCaseName = $"_{char.ToLowerInvariant(prop.Name[0])}{prop.Name.Substring(1)}";
+            // Check BOTH naming conventions (same as RestoreNetworkedProperties/RestoreConstructors)
+            var backingField = type.Fields.FirstOrDefault(f => f.Name == backingFieldName)
+                             ?? type.Fields.FirstOrDefault(f => f.Name == camelCaseName);
             if (backingField != null)
             {
                 fieldRedirectMap[defaultFieldName] = _module.ImportReference(backingField);
@@ -2547,21 +2568,56 @@ class DeweaverEngine
                 }
 
                 // Pass 2: Remap branch targets to point to the new cloned instructions.
+                // Safety: If a branch target was NOT in the captured set (dangling reference
+                // to an instruction from the now-removed CopyBackingFieldsToState method),
+                // replace the branch with a Nop to avoid invalid IL.
+                var danglingBranches = new List<Instruction>();
                 foreach (var clone in insertInstrs)
                 {
-                    if (clone.Operand is Instruction oldTarget && instructionMap.TryGetValue(oldTarget, out var newTarget))
+                    if (clone.Operand is Instruction oldTarget)
                     {
-                        clone.Operand = newTarget;
+                        if (instructionMap.TryGetValue(oldTarget, out var newTarget))
+                        {
+                            clone.Operand = newTarget;
+                        }
+                        else
+                        {
+                            // Dangling branch target - points to instruction from removed method body.
+                            // Replace with Nop to avoid invalid IL on write.
+                            Console.WriteLine($"    WARNING: Dangling branch target in cloned init, replacing with Nop");
+                            danglingBranches.Add(clone);
+                        }
                     }
                     else if (clone.Operand is Instruction[] oldTargets)
                     {
                         // Switch instruction: array of branch targets
+                        bool hasDangling = false;
                         var remapped = new Instruction[oldTargets.Length];
                         for (int t = 0; t < oldTargets.Length; t++)
                         {
-                            remapped[t] = instructionMap.TryGetValue(oldTargets[t], out var nt) ? nt : oldTargets[t];
+                            if (instructionMap.TryGetValue(oldTargets[t], out var nt))
+                            {
+                                remapped[t] = nt;
+                            }
+                            else
+                            {
+                                hasDangling = true;
+                                remapped[t] = oldTargets[t]; // can't fix switch arrays easily
+                            }
                         }
-                        clone.Operand = remapped;
+                        if (!hasDangling)
+                            clone.Operand = remapped;
+                        else
+                            Console.WriteLine($"    WARNING: Dangling switch target in cloned init");
+                    }
+                }
+                // Remove dangling branch instructions and replace with Nops
+                foreach (var dangling in danglingBranches)
+                {
+                    int idx = insertInstrs.IndexOf(dangling);
+                    if (idx >= 0)
+                    {
+                        insertInstrs[idx] = il.Create(OpCodes.Nop);
                     }
                 }
 
@@ -3037,29 +3093,20 @@ class DeweaverEngine
             var savedMeta = propMetaDict.TryGetValue(prop.Name, out var m) ? m : null;
             EnsureNetworkedAttribute(prop, savedMeta);
 
-            // Ensure [Capacity] and [Accuracy] survive
-            var capacityAttr = prop.CustomAttributes.FirstOrDefault(a =>
-                a.AttributeType.Name == "CapacityAttribute");
-            var accuracyAttr = prop.CustomAttributes.FirstOrDefault(a =>
-                a.AttributeType.Name == "AccuracyAttribute");
+            // [Capacity] and [Accuracy] are preserved on the property by the weaver
+            // (per Fusion.CodeGen.cs VisitPropertyMovableAttributes lines 2078-2081).
+            // If moved to field by older weaver, MigrateAttributesFromWeaverFieldsToProperties
+            // handles the migration (Step 3b).
 
-            if (capacityAttr != null && !prop.CustomAttributes.Any(a => a.AttributeType.Name == "CapacityAttribute"))
-            {
-                prop.CustomAttributes.Add(capacityAttr);
-                _restoredCapacityAttrs++;
-            }
-            if (accuracyAttr != null && !prop.CustomAttributes.Any(a => a.AttributeType.Name == "AccuracyAttribute"))
-            {
-                prop.CustomAttributes.Add(accuracyAttr);
-                _restoredAccuracyAttrs++;
-            }
-
+            // Check BOTH backing field naming conventions (same as RestoreNetworkedProperties)
             var backingName = $"<{prop.Name}>k__BackingField";
-            var backingField = type.Fields.FirstOrDefault(f => f.Name == backingName);
+            var camelCaseName = $"_{char.ToLowerInvariant(prop.Name[0])}{prop.Name.Substring(1)}";
+            var backingField = type.Fields.FirstOrDefault(f => f.Name == backingName)
+                             ?? type.Fields.FirstOrDefault(f => f.Name == camelCaseName);
             if (backingField == null) continue;
             var fieldRef = _module.ImportReference(backingField);
 
-            if (prop.GetMethod != null)
+            if (prop.GetMethod != null && prop.GetMethod.Body != null)
             {
                 var il = prop.GetMethod.Body.GetILProcessor();
                 prop.GetMethod.Body.Instructions.Clear();
@@ -3071,7 +3118,7 @@ class DeweaverEngine
                 EnsureCompilerGeneratedOnMethod(prop.GetMethod);
                 _restoredPropertyBodies++;
             }
-            if (prop.SetMethod != null)
+            if (prop.SetMethod != null && prop.SetMethod.Body != null)
             {
                 var il = prop.SetMethod.Body.GetILProcessor();
                 prop.SetMethod.Body.Instructions.Clear();
@@ -3100,15 +3147,13 @@ class DeweaverEngine
         }
 
         // Remove weaver-generated helper methods
+        // Note: setDefaults/MakeInitializer/MakeRef/MakePtr are NOT weaver-generated method names
+        // in IL output — they are local variable names and base class methods in the weaver C# source.
+        // Removed dead checks; kept only patterns that actually exist in woven IL.
         var weaverMethods = type.Methods.Where(m =>
-            m.Name == "setDefaults" ||
-            m.Name == "MakeInitializer" ||
-            m.Name == "MakeRef" ||
-            m.Name == "MakePtr" ||
             m.Name.StartsWith("MakeRef_") ||
             m.Name.StartsWith("MakePtr_") ||
-            (m.Name.EndsWith("_Read") && SafeHasAttribute(m, "WeaverGeneratedAttribute")) ||
-            (m.Name.EndsWith("_Write") && SafeHasAttribute(m, "WeaverGeneratedAttribute"))).ToList();
+            SafeHasAttribute(m, "WeaverGeneratedAttribute")).ToList();
         foreach (var m in weaverMethods)
         {
             type.Methods.Remove(m);
@@ -4168,8 +4213,7 @@ class DeweaverEngine
 
         var codeGenAsmRefs = _module.AssemblyReferences
             .Where(ar => ar.Name.Contains("Fusion.CodeGen") ||
-                         ar.Name.Contains("CodeGen") && ar.Name.StartsWith("Fusion") ||
-                         ar.Name == "Fusion.CodeGen")
+                         (ar.Name.Contains("CodeGen") && ar.Name.StartsWith("Fusion")))
             .ToList();
 
         foreach (var asmRef in codeGenAsmRefs)
@@ -4916,7 +4960,7 @@ class DeweaverEngine
         if (op == OpCodes.Initobj) return (1, 0);
         return (0, 0);
     }
-    #endregion    #endregion
+    #endregion
 
     #region Step 18: Validate and Fix Method Body Stack Balance
 
@@ -5853,6 +5897,7 @@ class DeweaverEngine
                 var fieldRef = _module.ImportReference(backingField);
 
                 // Restore getter to: return ref this.backingField;
+                if (prop.GetMethod?.Body == null) continue;
                 var il = prop.GetMethod.Body.GetILProcessor();
                 prop.GetMethod.Body.Instructions.Clear();
                 prop.GetMethod.Body.Variables.Clear();
@@ -6083,7 +6128,7 @@ class DeweaverEngine
         {
             if (type.Namespace == "Fusion.CodeGen") continue;
             if (type.IsValueType) continue; // Don't remove struct constructors
-            if (!IsNetworkBehaviour(type) && !IsSimulationBehaviour(type)) continue;
+            if (!IsNetworkBehaviour(type)) continue;
 
             var ctors = type.Methods
                 .Where(m => m.IsConstructor && !m.IsStatic && m.Parameters.Count == 0 && m.Body != null)
@@ -6989,8 +7034,7 @@ class DeweaverEngine
         Console.WriteLine($"  Weaved attributes removed:      {_removedWeavedAttrs}");
         Console.WriteLine($"  [Networked] attrs ensured:      {_ensuredNetworkedAttrs}");
         Console.WriteLine($"  [Networked] metadata preserved: {_preservedNetworkedMetadata}");
-        Console.WriteLine($"  [Capacity] attrs restored:      {_restoredCapacityAttrs}");
-        Console.WriteLine($"  [Accuracy] attrs restored:      {_restoredAccuracyAttrs}");
+
         Console.WriteLine($"  Ptr null checks stripped:       {_removedPtrNullChecks}");
         Console.WriteLine($"  Default fields removed:         {_removedDefaultFields}");
         Console.WriteLine($"  Backing fields restored:        {_restoredBackingFields}");
@@ -7070,6 +7114,31 @@ class TolerantAssemblyResolver : IAssemblyResolver
     public TolerantAssemblyResolver(DefaultAssemblyResolver inner)
     {
         _inner = inner;
+    }
+
+    /// <summary>
+    /// Pass-through to inner DefaultAssemblyResolver.AddSearchDirectory.
+    /// Required because Cecil's ReaderParameters.AssemblyResolver is IAssemblyResolver,
+    /// which does not expose AddSearchDirectory.
+    /// </summary>
+    public void AddSearchDirectory(string directory)
+    {
+        _inner.AddSearchDirectory(directory);
+    }
+
+    /// <summary>
+    /// Expose GetAssembly for diagnostic purposes.
+    /// </summary>
+    public AssemblyDefinition GetAssembly(AssemblyNameReference name)
+    {
+        try
+        {
+            return _inner.Resolve(name);
+        }
+        catch
+        {
+            return GetOrCreateStub(name);
+        }
     }
 
     public AssemblyDefinition Resolve(AssemblyNameReference name)
