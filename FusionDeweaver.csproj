@@ -12,4 +12,9 @@
     <PackageReference Include="Mono.Cecil" Version="0.11.6" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="Photon Fusion 1.8.8\**" />
+    <Compile Remove="Photon Fusion 2.0\**" />
+  </ItemGroup>
+
 </Project>
