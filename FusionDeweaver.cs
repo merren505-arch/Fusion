@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
+using Mono.Cecil.Rocks;
 using Mono.Collections.Generic;
 
 namespace FusionDeweaver;
@@ -133,6 +134,7 @@ class DeweaverEngine
     private int _ensuredNetworkedAttrs;
     private int _removedPtrNullChecks;
     private int _preservedNetworkedMetadata;
+    private int _purgedPhantomTypes;
 
     private int _purgedCodeGenTypeRefs;
     private int _purgedCodeGenMemberRefs;
@@ -171,7 +173,6 @@ class DeweaverEngine
     private int _createdSetters;
     private int _scrubbedOrphanedFusionTypeRefs;
     private int _importSanitizedRefs;
-    private int _stackNeutralReplacements;
     private int _invalidMethodBodiesFixed;
     private int _stackMergeFixes;
     private int _deadBranchesFixed;
@@ -189,6 +190,62 @@ class DeweaverEngine
     private void MarkMethodModified(MethodDefinition method)
     {
         _modifiedMethods.Add($"{method.DeclaringType.FullName}::{method.Name}");
+    }
+
+    private void PrepareMethod(MethodBody body)
+    {
+        body.SimplifyMacros();
+    }
+
+    private void FinalizeMethod(MethodBody body)
+    {
+        // Local variable garbage collection
+        if (body.Instructions.Count > 0)
+        {
+            var usedVariables = new HashSet<VariableDefinition>();
+            foreach (var instr in body.Instructions)
+            {
+                var variable = ResolveLocVariable(instr, body);
+                if (variable != null)
+                {
+                    usedVariables.Add(variable);
+                }
+            }
+
+            for (int i = body.Variables.Count - 1; i >= 0; i--)
+            {
+                if (!usedVariables.Contains(body.Variables[i]))
+                {
+                    body.Variables.RemoveAt(i);
+                }
+            }
+        }
+
+        body.OptimizeMacros();
+    }
+
+    private void IsolateDeadBlock(ILProcessor il, Instruction start, Instruction end)
+    {
+        var target = end.Next;
+        if (target == null)
+        {
+            target = il.Create(OpCodes.Ret);
+            il.Append(target);
+        }
+
+        var br = il.Create(OpCodes.Br, target);
+        il.InsertBefore(start, br);
+
+        // Nullify member references within the dead block to prevent resolution errors
+        var current = start;
+        while (current != null && current != target)
+        {
+            if (current.Operand is MemberReference)
+            {
+                current.Operand = null;
+            }
+            current = current.Next;
+        }
     }
 
     // Captured initialization instructions from CopyBackingFieldsToState, keyed by type fullname
@@ -572,6 +629,7 @@ class DeweaverEngine
     {
         if (method.Body == null) return;
 
+        PrepareMethod(method.Body);
         var instructions = method.Body.Instructions;
         if (instructions.Count < 3) return;
 
@@ -580,117 +638,76 @@ class DeweaverEngine
 
         if (!isStaticRpc && !isInstanceRpc) return;
 
-        int brfalseIndex = FindBrfalseAfterInvokeRpcCheck(instructions, isStaticRpc);
-        if (brfalseIndex < 0) return;
+        // Phase 2: Deterministic RPC Restoration (Master Plan Task 2)
+        // Scan for the forward Br instruction that the weaver injects at the end of the send-dispatch path.
+        // The target of that branch is the exact, guaranteed start of the user's original code (inv label).
+        Instruction? invLabel = null;
+        Instruction? brToInv = null;
 
-        Instruction? sendTarget = null;
-        if (instructions[brfalseIndex].Operand is Instruction target)
-            sendTarget = target;
-
-        int invokeStart = FindInvokePathStart(instructions, brfalseIndex, isStaticRpc);
-        if (invokeStart < 0) return;
-
-        int sendStartIndex = -1;
-        if (sendTarget != null)
+        for (int i = 0; i < instructions.Count; i++)
         {
-            for (int j = 0; j < instructions.Count; j++)
+            var instr = instructions[i];
+            if (instr.OpCode == OpCodes.Br && instr.Operand is Instruction target)
             {
-                if (instructions[j] == sendTarget)
+                // The weaver's Br to inv is usually a forward branch that skips the send logic.
+                // It's deterministic: it's the only Br that jumps deep into the method past the dispatch logic.
+                if (instructions.IndexOf(target) > i + 5)
                 {
-                    sendStartIndex = j;
+                    brToInv = instr;
+                    invLabel = target;
                     break;
                 }
             }
         }
 
-        var bodyInstrs = new List<Instruction>();
-        if (sendStartIndex > invokeStart)
+        if (invLabel == null || brToInv == null)
         {
-            for (int i = invokeStart; i < sendStartIndex; i++)
-                bodyInstrs.Add(instructions[i]);
-        }
-        else
-        {
-            for (int i = invokeStart; i < instructions.Count; i++)
-                bodyInstrs.Add(instructions[i]);
+            // Fallback to legacy detection if Br not found (safety net)
+            int brfalseIndex = FindBrfalseAfterInvokeRpcCheck(instructions, isStaticRpc);
+            if (brfalseIndex >= 0)
+            {
+                int invokeStart = FindInvokePathStart(instructions, brfalseIndex, isStaticRpc);
+                if (invokeStart >= 0)
+                    invLabel = instructions[invokeStart];
+            }
         }
 
-        // Bug R: Even if body is empty, we must continue to ensure the method 
-        // is restored to a clean Ret or Default Return to avoid leaving weaver logic behind.
-        // if (bodyInstrs.Count == 0) return;
-        
-        bool returnsRpcInvokeInfo = method.ReturnType.Name == "RpcInvokeInfo";
+        if (invLabel == null) return;
 
         var il = method.Body.GetILProcessor();
-
-        // Bug AC: Preserve ExceptionHandlers! Do not use Instructions.Clear() or ExceptionHandlers.Clear()
-        // Instead, safely remove instructions that belong to the weaver's dispatch/send logic.
-        var bodySet = new HashSet<Instruction>(bodyInstrs);
-        var toRemove = new List<Instruction>();
         
-        foreach (var instr in method.Body.Instructions)
-        {
-            if (!bodySet.Contains(instr))
-            {
-                toRemove.Add(instr);
-            }
-            else if (returnsRpcInvokeInfo && instr.OpCode == OpCodes.Pop)
-            {
-                toRemove.Add(instr);
-            }
-        }
+        // Neutralize everything from the first instruction up to the user code start.
+        // We use IsolateDeadBlock to render the weaver prologue unreachable.
+        IsolateDeadBlock(il, instructions[0], instructions[instructions.IndexOf(invLabel) - 1]);
 
-        foreach (var instr in toRemove)
+        bool returnsRpcInvokeInfo = method.ReturnType.Name == "RpcInvokeInfo";
+        if (returnsRpcInvokeInfo)
         {
-            il.Remove(instr);
-        }
+            // For RpcInvokeInfo returns, find the Pop -> Ldloc -> Ret sequence
+            // and replace it with IL that generates default(RpcInvokeInfo).
+            for (int i = 0; i < instructions.Count - 2; i++)
+            {
+                if (instructions[i].OpCode == OpCodes.Pop &&
+                    instructions[i+1].OpCode == OpCodes.Ldloc &&
+                    instructions[i+2].OpCode == OpCodes.Ret)
+                {
+                    var rpcInfoVar = new VariableDefinition(ImportType("Fusion.RpcInvokeInfo"));
+                    method.Body.Variables.Add(rpcInfoVar);
+                    method.Body.InitLocals = true;
 
-        // Ensure proper return
-        if (method.Body.Instructions.Count == 0 || method.Body.Instructions.Last().OpCode != OpCodes.Ret)
-        {
-            if (returnsRpcInvokeInfo)
-            {
-                var rpcInfoVar = new VariableDefinition(ImportType("Fusion.RpcInvokeInfo"));
-                method.Body.Variables.Add(rpcInfoVar);
-                method.Body.InitLocals = true;
-                il.Emit(OpCodes.Ldloca_S, rpcInfoVar);
-                il.Emit(OpCodes.Initobj, rpcInfoVar.VariableType);
-                il.Emit(OpCodes.Ldloc, rpcInfoVar);
-                il.Emit(OpCodes.Ret);
-            }
-            else if (method.ReturnType.MetadataType == MetadataType.Void)
-            {
-                il.Emit(OpCodes.Ret);
-            }
-            else
-            {
-                EmitDefaultReturn(method);
+                    il.Replace(instructions[i], il.Create(OpCodes.Ldloca_S, rpcInfoVar));
+                    il.Replace(instructions[i+1], il.Create(OpCodes.Initobj, rpcInfoVar.VariableType));
+                    il.InsertAfter(instructions[i+1], il.Create(OpCodes.Ldloc, rpcInfoVar));
+                    break;
+                }
             }
         }
 
         MarkMethodModified(method);
         _restoredRpcMethods++;
-        
-        // Bug B: Remap branch targets that point outside the new body to prevent invalid IL
-        var newInstructions = method.Body.Instructions;
-        var instructionSet = new HashSet<Instruction>(newInstructions);
-        foreach (var instr in newInstructions)
-        {
-            if (instr.Operand is Instruction branchTarget && !instructionSet.Contains(branchTarget))
-            {
-                instr.Operand = newInstructions.Last(); // Fallback to last instruction (usually Ret)
-            }
-            else if (instr.Operand is Instruction[] targets)
-            {
-                for (int i = 0; i < targets.Length; i++)
-                {
-                    if (!instructionSet.Contains(targets[i]))
-                        targets[i] = newInstructions.Last();
-                }
-            }
-        }
+        FinalizeMethod(method.Body);
 
-        Console.WriteLine($"  Restored RPC: {type.Name}::{method.Name} (static={isStaticRpc})");
+        Console.WriteLine($"  Restored RPC: {type.Name}::{method.Name} (deterministic=true)");
     }
 
     private bool IsStaticRpcPattern(Collection<Instruction> instructions)
@@ -938,6 +955,27 @@ class DeweaverEngine
 
         foreach (var prop in networkedProps)
         {
+            // Check for [Networked(Default = "_myField")]
+            var networkedAttr = prop.CustomAttributes.FirstOrDefault(a => a.AttributeType.Name == "NetworkedAttribute");
+            string? specifiedDefaultField = null;
+            if (networkedAttr != null)
+            {
+                foreach (var na in networkedAttr.Properties)
+                {
+                    if (na.Name == "Default")
+                    {
+                        specifiedDefaultField = na.Argument.Value as string;
+                        break;
+                    }
+                }
+            }
+
+            if (specifiedDefaultField != null && type.Fields.Any(f => f.Name == specifiedDefaultField))
+            {
+                Console.WriteLine($"    Using specified default field for property {prop.Name}: {specifiedDefaultField}");
+                continue;
+            }
+
             // Always use the standard C# auto-property backing field naming convention:
             // <PropName>k__BackingField. This ensures ICSharpCode.Decompiler recognizes
             // the field as a backing field and emits the property as an auto-property
@@ -1095,15 +1133,34 @@ class DeweaverEngine
                     Console.WriteLine($"    Cleaned NetworkString/string property: {prop.Name} ({prop.PropertyType.Name})");
                 }
 
-                        // Find the backing field
-                // Per weaver source, the original backing field is named <PropName>k__BackingField.
-                // However, CreateBackingFieldsForNetworkedProperties may have created it as _propName
-                // if the original was removed. We must check BOTH naming conventions.
-                var backingName = $"<{prop.Name}>k__BackingField";
-                var altBackingName = $"_{prop.Name}";
+                // Find the backing field
+                string? specifiedDefaultField = savedMeta?.Default;
+                FieldDefinition? backingField = null;
 
-                var backingField = type.Fields.FirstOrDefault(f => f.Name == backingName)
+                if (specifiedDefaultField != null)
+                {
+                    backingField = type.Fields.FirstOrDefault(f => f.Name == specifiedDefaultField);
+                }
+
+                if (backingField == null)
+                {
+                    var autoName = $"<{prop.Name}>k__BackingField";
+                    backingField = type.Fields.FirstOrDefault(f => f.Name == autoName);
+                }
+
+                if (backingField == null)
+                {
+                    backingField = type.Fields.FirstOrDefault(f => f.Name == $"_{prop.Name}");
+                }
+
+                if (backingField == null)
+                {
+                    // Fallback to searching by type name (less safe but covers some Fusion 1 edge cases)
+                    var autoName = $"<{prop.Name}>k__BackingField";
+                    var altBackingName = $"_{prop.Name}";
+                    backingField = type.Fields.FirstOrDefault(f => f.Name == autoName)
                                  ?? type.Fields.FirstOrDefault(f => f.Name == altBackingName);
+                }
 
                 // Check if this property has RetainIL=true - if so, try to preserve the original body
                 bool isRetainIL = savedMeta?.RetainIL == true;
@@ -1111,13 +1168,6 @@ class DeweaverEngine
                 if (isRetainIL && backingField != null)
                 {
                     // RetainIL: The weaver is supposed to preserve the user's original property body.
-                    // Per Fusion.CodeGen.cs IsWeavableProperty (line 673-682), RetainIL=true means the weaver
-                    // should keep the original backing field and NOT obliterate the accessor bodies.
-                    // However, in practice, some Fusion versions or obfuscators may still modify the body.
-                    //
-                    // Strategy: Try StripWeaverEpilogue first. If it finds a backing field store
-                    // (meaning the original body is intact), preserve it. Otherwise, fall through to
-                    // normal restoration (create simple get/set with backing field).
                     StripWeaverEpilogue(prop.SetMethod, type, prop.Name, backingField);
 
                     // Check if the setter has a valid Stfld to the backing field (body was preserved)
@@ -1127,14 +1177,7 @@ class DeweaverEngine
                             i.Operand is FieldReference fr &&
                             fr.Name == backingField.Name);
 
-                    if (!setterHasBackingFieldStore)
-                    {
-                        // Weaver obliterated the body despite RetainIL - fall through to normal restore.
-                        // This happens when the Fusion version doesn't fully support RetainIL,
-                        // or when the backing field was removed during weaving.
-                        Console.WriteLine($"    RetainIL property {prop.Name} body was obliterated, restoring normally");
-                    }
-                    else
+                    if (setterHasBackingFieldStore)
                     {
                         // Body was preserved - check getter too
                         bool getterHasBackingFieldLoad = prop.GetMethod?.Body != null &&
@@ -1143,41 +1186,36 @@ class DeweaverEngine
                                 i.Operand is FieldReference fr &&
                                 fr.Name == backingField.Name);
 
-                        if (!getterHasBackingFieldLoad)
+                        if (getterHasBackingFieldLoad)
                         {
-                            // Getter was also obliterated - restore it normally
-                            if (prop.GetMethod?.Body == null) goto PropertyRestored;
-                            ClearReadOnlyGetterAttribute(prop.GetMethod);
-                            var fieldRef = _module.ImportReference(backingField);
-                            var il = prop.GetMethod.Body.GetILProcessor();
-                            prop.GetMethod.Body.Instructions.Clear();
-                            prop.GetMethod.Body.Variables.Clear();
-                            prop.GetMethod.Body.ExceptionHandlers.Clear();
-                            il.Emit(OpCodes.Ldarg_0);
-                            il.Emit(OpCodes.Ldfld, fieldRef);
-                            il.Emit(OpCodes.Ret);
-                            MarkMethodModified(prop.GetMethod);
-                            EnsureCompilerGeneratedOnMethod(prop.GetMethod);
-                            _restoredPropertyBodies++;
+                            _retainILPropertiesPreserved++;
+                            Console.WriteLine($"    Preserved RetainIL property body: {prop.Name}");
+                            goto PropertyRestored;
                         }
-
-                        _retainILPropertiesPreserved++;
-                        Console.WriteLine($"    Preserved RetainIL property body: {prop.Name}");
-                        // Skip the else-if below since we handled it
-                        goto PropertyRestored;
                     }
                 }
 
                 if (backingField != null)
                 {
-                    // If the backing field uses an alternative name (e.g. _CurrentState),
-                    // rename it to the standard C# auto-property name (<CurrentState>k__BackingField).
-                    // This is critical for ICSharpCode.Decompiler to fold it into an auto-property.
-                    if (backingField.Name != backingName)
+                    // Normalize name if not user-specified
+                    if (specifiedDefaultField == null)
                     {
-                        Console.WriteLine($"    Renaming non-standard backing field: {backingField.Name} -> {backingName}");
-                        RenameFieldAndFixReferences(type, backingField, backingName);
+                        var autoName = $"<{prop.Name}>k__BackingField";
+                        if (backingField.Name != autoName)
+                        {
+                            Console.WriteLine($"    Renaming non-standard backing field: {backingField.Name} -> {autoName}");
+                            RenameFieldAndFixReferences(type, backingField, autoName);
+                        }
                     }
+
+                    // Determine if it should have a setter
+                    bool isCollection = prop.PropertyType.Name.StartsWith("NetworkArray`") ||
+                                        prop.PropertyType.Name.StartsWith("NetworkDictionary`") ||
+                                        prop.PropertyType.Name.StartsWith("NetworkLinkedList`") ||
+                                        (prop.PropertyType.Name.StartsWith("NetworkString`") && !prop.CustomAttributes.Any(a => a.AttributeType.Name == "NetworkedWeavedStringAttribute"));
+
+                    bool isRefReturn = prop.GetMethod?.ReturnType is ByReferenceType;
+                    bool shouldHaveSetter = !isCollection && !isRefReturn;
 
                     // Ensure the backing field has correct metadata for auto-property recognition.
                     EnsureBackingFieldMetadata(backingField);
@@ -1187,8 +1225,8 @@ class DeweaverEngine
                     // Restore getter to simple: return this.backingField;
                     if (prop.GetMethod != null && prop.GetMethod.Body != null)
                     {
-                        // Clear IsReadOnly flag — Fusion adds 'readonly get' which prevents
-                        // ICSharpCode.Decompiler from folding into auto-properties.
+                        PrepareMethod(prop.GetMethod.Body);
+                        // Clear IsReadOnly flag
                         ClearReadOnlyGetterAttribute(prop.GetMethod);
 
                         var il = prop.GetMethod.Body.GetILProcessor();
@@ -1196,47 +1234,75 @@ class DeweaverEngine
                         prop.GetMethod.Body.Variables.Clear();
                         prop.GetMethod.Body.ExceptionHandlers.Clear();
                         il.Emit(OpCodes.Ldarg_0);
-                        il.Emit(OpCodes.Ldfld, fieldRef);
+                        if (isRefReturn)
+                            il.Emit(OpCodes.Ldflda, fieldRef);
+                        else
+                            il.Emit(OpCodes.Ldfld, fieldRef);
                         il.Emit(OpCodes.Ret);
 
-                        // Ensure [CompilerGenerated] on the getter for perfect C# auto-property output
                         EnsureCompilerGeneratedOnMethod(prop.GetMethod);
                         MarkMethodModified(prop.GetMethod);
+                        FinalizeMethod(prop.GetMethod.Body);
 
                         _restoredPropertyBodies++;
                     }
 
-                    // Restore setter to simple: this.backingField = value;
-                    if (prop.SetMethod != null && prop.SetMethod.Body != null)
+                    // Restore or Remove setter
+                    if (shouldHaveSetter)
                     {
-                        var setBody = prop.SetMethod.Body;
-                        var il = setBody.GetILProcessor();
-                        setBody.Instructions.Clear();
-                        setBody.Variables.Clear();
-                        setBody.ExceptionHandlers.Clear();
-                        il.Emit(OpCodes.Ldarg_0);
-                        il.Emit(OpCodes.Ldarg_1);
-                        il.Emit(OpCodes.Stfld, fieldRef);
-                        il.Emit(OpCodes.Ret);
+                        if (prop.SetMethod != null && prop.SetMethod.Body != null)
+                        {
+                            PrepareMethod(prop.SetMethod.Body);
+                            var setBody = prop.SetMethod.Body;
+                            var il = setBody.GetILProcessor();
+                            setBody.Instructions.Clear();
+                            setBody.Variables.Clear();
+                            setBody.ExceptionHandlers.Clear();
+                            il.Emit(OpCodes.Ldarg_0);
+                            il.Emit(OpCodes.Ldarg_1);
+                            il.Emit(OpCodes.Stfld, fieldRef);
+                            il.Emit(OpCodes.Ret);
 
-                        // Ensure [CompilerGenerated] on the setter for perfect C# auto-property output
-                        EnsureCompilerGeneratedOnMethod(prop.SetMethod);
-                        MarkMethodModified(prop.SetMethod);
+                            EnsureCompilerGeneratedOnMethod(prop.SetMethod);
+                            MarkMethodModified(prop.SetMethod);
+                            FinalizeMethod(prop.SetMethod.Body);
 
-                        _restoredPropertyBodies++;
+                            _restoredPropertyBodies++;
+                        }
+                        else if (prop.SetMethod == null && prop.GetMethod != null)
+                        {
+                            CreateSimpleSetter(prop, backingField);
+                            _restoredPropertyBodies++;
+                        }
                     }
-                    else if (prop.SetMethod == null && prop.GetMethod != null)
+                    else
                     {
-                        // Get-only property: Fusion removed the setter. Create a simple setter
-                        // so ICSharpCode.Decompiler can fold into auto-property { get; set; }.
-                        // For [Networked] properties, a setter is expected (Fusion sets them
-                        // during state synchronization).
-                        CreateSimpleSetter(prop, backingField);
-                        _restoredPropertyBodies++;
+                        if (prop.SetMethod != null)
+                        {
+                            type.Methods.Remove(prop.SetMethod);
+                            prop.SetMethod = null;
+                            _removedInvalidRefReturnSetters++;
+                        }
                     }
                 }
 
             PropertyRestored:
+                // Surgical [Preserve] removal for OnChanged handlers
+                if (savedMeta?.OnChanged != null)
+                {
+                    var onChangedMethod = type.Methods.FirstOrDefault(m => m.Name == savedMeta.OnChanged);
+                    if (onChangedMethod != null)
+                    {
+                        var preserveAttr = onChangedMethod.CustomAttributes.FirstOrDefault(a => a.AttributeType.Name == "PreserveAttribute");
+                        if (preserveAttr != null)
+                        {
+                            onChangedMethod.CustomAttributes.Remove(preserveAttr);
+                            _removedPreserveAttrs++;
+                            Console.WriteLine($"    Surgically removed [Preserve] from OnChanged handler: {onChangedMethod.Name}");
+                        }
+                    }
+                }
+
                 Console.WriteLine($"    Restored property: {prop.Name}");
             }
             catch (Exception ex)
@@ -1435,6 +1501,7 @@ class DeweaverEngine
     {
         if (accessor?.Body == null) return;
 
+        PrepareMethod(accessor.Body);
         var instructions = accessor.Body.Instructions;
         if (instructions.Count < 10) return;
 
@@ -1486,10 +1553,9 @@ class DeweaverEngine
         if (startIdx < 0) return;
 
         var il = accessor.Body.GetILProcessor();
-        for (int i = endIdx - 1; i >= startIdx; i--)
-        {
-            il.Remove(instructions[i]);
-        }
+        // Use IsolateDeadBlock instead of il.Remove to safely neutralize the Ptr null check
+        // without corrupting the stack or branch targets.
+        IsolateDeadBlock(il, instructions[startIdx], instructions[endIdx - 1]);
 
         _removedPtrNullChecks++;
         if (accessor != null) MarkMethodModified(accessor);
@@ -1669,13 +1735,14 @@ class DeweaverEngine
 
             if (toRemove.Count > 0)
             {
+                PrepareMethod(method.Body);
                 var il = method.Body.GetILProcessor();
                 foreach (var instr in toRemove.ToList())
                 {
-                    try { ReplaceInstructionWithStackNeutral(il, instr, false); }
-                    catch { try { il.Remove(instr); } catch { } }
+                    try { il.Remove(instr); } catch { }
                 }
                 MarkMethodModified(method);
+                FinalizeMethod(method.Body);
                 Console.WriteLine($"    Stripped {toRemove.Count} InvokeWeavedCode() call(s) from {type.Name}::{method.Name}");
             }
         }
@@ -1712,11 +1779,12 @@ class DeweaverEngine
             var method = type.Methods.FirstOrDefault(m => m.Name == msgName && m.Body != null);
             if (method == null) continue;
 
+            PrepareMethod(method.Body);
             var instructions = method.Body.Instructions;
-            if (instructions.Count < 2) continue;
 
             // Pattern: Ldarg_0, Call InternalOnXxx
-            if (instructions[0].OpCode == OpCodes.Ldarg_0 &&
+            if (instructions.Count >= 2 &&
+                instructions[0].OpCode == OpCodes.Ldarg_0 &&
                 instructions[1].OpCode == OpCodes.Call &&
                 instructions[1].Operand is MethodReference mr &&
                 mr.Name == internalNames[msgName])
@@ -1724,11 +1792,11 @@ class DeweaverEngine
                 var il = method.Body.GetILProcessor();
                 il.Remove(instructions[1]); // Remove Call first (higher index)
                 il.Remove(instructions[0]); // Then remove Ldarg_0
-                // Note: No MarkMethodModified here. Removing a Ldarg_0 + void call pair
-                // is stack-neutral and doesn't require Step 18/19 IL cleanup.
+                MarkMethodModified(method);
                 _removedInternalOnCalls++;
                 Console.WriteLine($"    Stripped InternalOn call from {type.Name}::{msgName}()");
             }
+            FinalizeMethod(method.Body);
         }
     }
 
@@ -2010,6 +2078,7 @@ class DeweaverEngine
 
         foreach (var ctor in type.Methods.Where(m => m.IsConstructor && !m.IsStatic && m.Body != null).ToList())
         {
+            PrepareMethod(ctor.Body);
             bool modified = false;
             foreach (var prop in networkedProps)
             {
@@ -2046,6 +2115,7 @@ class DeweaverEngine
                 MarkMethodModified(ctor);
                 _restoredConstructors++;
             }
+            FinalizeMethod(ctor.Body);
         }
     }
 
@@ -2058,6 +2128,7 @@ class DeweaverEngine
     /// </summary>
     private void StripDoubleInitPatterns(MethodDefinition ctor, TypeDefinition type)
     {
+        PrepareMethod(ctor.Body);
         var instructions = ctor.Body.Instructions;
         var toRemove = new List<Instruction>();
 
@@ -2087,6 +2158,7 @@ class DeweaverEngine
                 catch { }
             }
         }
+        FinalizeMethod(ctor.Body);
     }
 
     #endregion
@@ -2887,6 +2959,7 @@ class DeweaverEngine
     {
         if (method.Body == null) return;
 
+        PrepareMethod(method.Body);
         var instructions = method.Body.Instructions;
         var toRemove = new List<Instruction>();
         var toReplace = new Dictionary<Instruction, Instruction>(); // old -> new
@@ -3080,11 +3153,9 @@ class DeweaverEngine
 
             // Then remove with stack-neutral replacement (v8: never bare il.Remove for call instructions)
             foreach (var instr in toRemove.ToList())
-            {
-                try { ReplaceInstructionWithStackNeutral(il, instr, false); }
-                catch { try { il.Remove(instr); } catch { } }
-            }
+                try { il.Remove(instr); } catch { }
         }
+        FinalizeMethod(method.Body);
     }
 
     #endregion
@@ -3155,12 +3226,12 @@ class DeweaverEngine
             var il = accessor.Body.GetILProcessor();
             foreach (var instr in toRemove.ToList())
             {
-                // v8: Use stack-neutral replacement to avoid leaving orphaned values
-                try { ReplaceInstructionWithStackNeutral(il, instr, false); }
-                catch { try { il.Remove(instr); } catch { } }
+                try { il.Remove(instr); } catch { }
             }
+            MarkMethodModified(accessor);
             Console.WriteLine($"    Stripped {toRemove.Count} weaver epilogue instructions from {type.Name}.{propName}.set");
         }
+        FinalizeMethod(accessor.Body);
     }
 
     #endregion
@@ -3493,6 +3564,41 @@ class DeweaverEngine
             _module.Types.Remove(type);
             _removedGeneratedTypes++;
             Console.WriteLine($"  Removed DOTS reflection type: {type.FullName}");
+        }
+
+        PurgePhantomTypes();
+    }
+
+    private void PurgePhantomTypes()
+    {
+        Console.WriteLine("  Purging phantom types...");
+        var toRemove = new List<TypeDefinition>();
+        var allTypes = GetAllTypes();
+
+        foreach (var type in allTypes)
+        {
+            if (type.Name.Contains("e__FixedBuffer") ||
+                type.Name.Contains("FixedStorage@") ||
+                type.Name.Contains("UnityDictionarySurrogate@") ||
+                type.Name.Contains("UnityArraySurrogate@") ||
+                type.Name.Contains("UnityValueSurrogate@"))
+            {
+                toRemove.Add(type);
+            }
+        }
+
+        foreach (var type in toRemove)
+        {
+            if (type.DeclaringType != null)
+            {
+                type.DeclaringType.NestedTypes.Remove(type);
+            }
+            else
+            {
+                _module.Types.Remove(type);
+            }
+            _purgedPhantomTypes++;
+            Console.WriteLine($"    Purged phantom type: {type.FullName}");
         }
     }
 
@@ -3882,7 +3988,7 @@ class DeweaverEngine
                     for (int idx = toReplace.Count - 1; idx >= 0; idx--)
                     {
                         var (instr, isLdtokenPair) = toReplace[idx];
-                        ReplaceInstructionWithStackNeutral(il, instr, isLdtokenPair);
+                        il.Remove(instr);
                         replaced++;
                     }
 
@@ -3975,7 +4081,7 @@ class DeweaverEngine
                     var il = method.Body.GetILProcessor();
                     for (int idx = burstInstrs.Count - 1; idx >= 0; idx--)
                     {
-                        try { ReplaceInstructionWithStackNeutral(il, burstInstrs[idx], false); }
+                        try { il.Remove(burstInstrs[idx]); }
                         catch { }
                     }
                     removedCount += burstInstrs.Count;
@@ -4044,7 +4150,7 @@ class DeweaverEngine
                         var il = m.Body.GetILProcessor();
                         for (int idx = toReplace.Count - 1; idx >= 0; idx--)
                         {
-                            try { ReplaceInstructionWithStackNeutral(il, toReplace[idx], false); }
+                            try { il.Remove(toReplace[idx]); }
                             catch { }
                         }
                         removedCount += toReplace.Count;
@@ -4104,9 +4210,10 @@ class DeweaverEngine
                     for (int idx = toReplace.Count - 1; idx >= 0; idx--)
                     {
                         var (instr, isLdtokenPair) = toReplace[idx];
-                        ReplaceInstructionWithStackNeutral(il, instr, isLdtokenPair);
+                        il.Remove(instr);
                     }
                 }
+        FinalizeMethod(method.Body);
             }
         }
 
@@ -4197,16 +4304,18 @@ class DeweaverEngine
                 }
 
                 // Scrub method body instructions referencing CodeGen types
-                if (method.Body != null)
+                if (method.HasBody && method.Body.Instructions.Count > 0)
                 {
+                    PrepareMethod(method.Body);
+                    var il = method.Body.GetILProcessor();
                     var instrsToRemove = method.Body.Instructions.Where(i =>
                         IsInstructionReferencingCodeGen(i)).ToList();
 
-                    if (instrsToRemove.Count > 0 && instrsToRemove.Count == method.Body.Instructions.Count)
+                    foreach (var instr in instrsToRemove)
                     {
-                        // All instructions reference CodeGen - this method is entirely weaver-generated
-                        // (handled by Step6 already, but safety net)
+                        try { il.Remove(instr); } catch { }
                     }
+                    FinalizeMethod(method.Body);
                 }
             }
 
@@ -4733,10 +4842,11 @@ class DeweaverEngine
 
         foreach (var method in type.Methods.ToList())
         {
-            if (method.Body == null) continue;
+            if (!method.HasBody || method.Body.Instructions.Count == 0) continue;
 
             try
             {
+                PrepareMethod(method.Body);
                 var il = method.Body.GetILProcessor();
                 var instructions = method.Body.Instructions;
                 bool modified = false;
@@ -4805,6 +4915,7 @@ class DeweaverEngine
                     // Cecil's ILProcessor handles macro optimization automatically on write,
                     // but we ensure branches are consistent after our manual modifications.
                 }
+                FinalizeMethod(method.Body);
             }
             catch { }
         }
@@ -4900,206 +5011,12 @@ class DeweaverEngine
     /// - GetTypeFromHandle: pops 1, pushes 1 (Type) → if preceded by removed ldtoken,
     ///   replace with nop (the ldnull already provides the stack slot)
     /// </summary>
-    private void ReplaceInstructionWithStackNeutral(ILProcessor il, Instruction instr, bool isPartOfLdtokenPair)
-    {
-        var op = instr.OpCode;
-
-        // Handle ldtoken specially: it pushes 1 value (a handle)
-        // When it's part of a ldtoken+GetTypeFromHandle pair, we replace with ldnull
-        // since the pair's net effect is pushing 1 Type reference
-        // Handle ldtoken: it pushes a RuntimeHandle (struct)
-        // Bug AF: Replacing with ldnull for a struct is invalid. Push a zeroed struct instead.
-        if (op == OpCodes.Ldtoken)
-        {
-            if (instr.Operand is TypeReference tr)
-            {
-                var rthVar = new VariableDefinition(_module.ImportReference(tr.Module.ImportReference(typeof(System.RuntimeTypeHandle))));
-                il.Body.Variables.Add(rthVar);
-                il.Body.InitLocals = true;
-                il.InsertBefore(instr, il.Create(OpCodes.Ldloca_S, rthVar));
-                il.InsertBefore(instr, il.Create(OpCodes.Initobj, rthVar.VariableType));
-                il.Replace(instr, il.Create(OpCodes.Ldloc, rthVar));
-            }
-            else
-            {
-                // Fallback for method/field tokens: just nop it if we can't easily zero it
-                il.Replace(instr, il.Create(OpCodes.Nop));
-            }
-            _stackNeutralReplacements++;
-            return;
-        }
-
-        // Handle GetTypeFromHandle / GetMethodFromHandle when part of an ldtoken pair:
-        // The preceding ldtoken was already replaced with ldnull, so this instruction
-        // would consume that ldnull and push a Type/MethodBase. Replace with nop so
-        // the ldnull result stays on the stack as the "result".
-        if (isPartOfLdtokenPair && (op == OpCodes.Call) &&
-            instr.Operand is MethodReference mr &&
-            (mr.Name == "GetTypeFromHandle" || mr.Name == "GetMethodFromHandle" || mr.Name == "GetMethodHandle"))
-        {
-            var nop = il.Create(OpCodes.Nop);
-            il.Replace(instr, nop);
-            _stackNeutralReplacements++;
-            return;
-        }
-
-        // Handle call/callvirt instructions
-        if (op == OpCodes.Call || op == OpCodes.Callvirt)
-        {
-            if (instr.Operand is MethodReference callMr)
-            {
-                // Calculate how many values the call pops (args + this) and pushes (return value)
-                int pops = callMr.Parameters.Count + (callMr.HasThis ? 1 : 0);
-                bool hasReturn = callMr.ReturnType.MetadataType != MetadataType.Void;
-
-                // Build replacement: pop × pops + (default return if hasReturn)
-                var replacements = new List<Instruction>();
-                for (int i = 0; i < pops; i++)
-                    replacements.Add(il.Create(OpCodes.Pop));
-                
-                if (hasReturn)
-                {
-                    // Bug AA: Use default value push for ValueTypes, ldnull only for Classes
-                    var retType = callMr.ReturnType;
-                    if (retType.IsValueType)
-                    {
-                        var tmp = new VariableDefinition(_module.ImportReference(retType));
-                        il.Body.Variables.Add(tmp);
-                        il.Body.InitLocals = true;
-                        replacements.Add(il.Create(OpCodes.Ldloca_S, tmp));
-                        replacements.Add(il.Create(OpCodes.Initobj, tmp.VariableType));
-                        replacements.Add(il.Create(OpCodes.Ldloc, tmp));
-                    }
-                    else
-                    {
-                        replacements.Add(il.Create(OpCodes.Ldnull));
-                    }
-                }
-
-                // Insert replacements before the instruction, then remove original
-                foreach (var rep in replacements)
-                    il.InsertBefore(instr, rep);
-                il.Remove(instr);
-                _stackNeutralReplacements++;
-                return;
-            }
-
-            // Fallback for calls without a MethodReference operand
-            var nopCall = il.Create(OpCodes.Nop);
-            il.Replace(instr, nopCall);
-            _stackNeutralReplacements++;
-            return;
-        }
-
-        // Handle newobj instructions
-        if (op == OpCodes.Newobj)
-        {
-            if (instr.Operand is MethodReference ctorMr)
-            {
-                int pops = ctorMr.Parameters.Count; // newobj doesn't pop 'this'
-                // newobj pushes 1 value (the new object)
-                var replacements = new List<Instruction>();
-                for (int i = 0; i < pops; i++)
-                    replacements.Add(il.Create(OpCodes.Pop));
-                replacements.Add(il.Create(OpCodes.Ldnull)); // push null as "result"
-
-                foreach (var rep in replacements)
-                    il.InsertBefore(instr, rep);
-                il.Remove(instr);
-                _stackNeutralReplacements++;
-                return;
-            }
-        }
-
-        // Handle field access instructions
-        // Ldfld: pops 1 (obj), pushes 1 (value) → replace with pop; ldnull
-        if (op == OpCodes.Ldfld)
-        {
-            il.InsertBefore(instr, il.Create(OpCodes.Pop));
-            il.Replace(instr, il.Create(OpCodes.Ldnull));
-            _stackNeutralReplacements++;
-            return;
-        }
-
-        // Stfld: pops 2 (obj + value), pushes 0 → replace with pop; pop
-        if (op == OpCodes.Stfld)
-        {
-            var pop1 = il.Create(OpCodes.Pop);
-            var pop2 = il.Create(OpCodes.Pop);
-            il.InsertBefore(instr, pop1);
-            il.Replace(instr, pop2);
-            _stackNeutralReplacements++;
-            return;
-        }
-
-        // Ldsfld: pops 0, pushes 1 → replace with ldnull
-        if (op == OpCodes.Ldsfld)
-        {
-            il.Replace(instr, il.Create(OpCodes.Ldnull));
-            _stackNeutralReplacements++;
-            return;
-        }
-
-        // Stsfld: pops 1, pushes 0 → replace with pop
-        if (op == OpCodes.Stsfld)
-        {
-            il.Replace(instr, il.Create(OpCodes.Pop));
-            _stackNeutralReplacements++;
-            return;
-        }
-
-        // Ldflda: pops 1 (obj), pushes 1 (ptr) → replace with pop; ldnull
-        if (op == OpCodes.Ldflda)
-        {
-            il.InsertBefore(instr, il.Create(OpCodes.Pop));
-            il.Replace(instr, il.Create(OpCodes.Ldnull));
-            _stackNeutralReplacements++;
-            return;
-        }
-
-        // Ldsflda: pops 0, pushes 1 (ptr) → replace with ldnull
-        if (op == OpCodes.Ldsflda)
-        {
-            il.Replace(instr, il.Create(OpCodes.Ldnull));
-             _stackNeutralReplacements++;
-            return;
-        }
-
-        // Starg/Starg_S: pops 1 (value), pushes 0 → replace with pop
-        if (op == OpCodes.Starg || op == OpCodes.Starg_S)
-        {
-            il.Replace(instr, il.Create(OpCodes.Pop));
-            _stackNeutralReplacements++;
-            return;
-        }
-
-        // For any other instruction, compute stack delta generically
-        var (pops2, pushes2) = GetInstructionStackDelta(instr);
-        var fallbackReplacements = new List<Instruction>();
-        for (int i = 0; i < pops2; i++)
-            fallbackReplacements.Add(il.Create(OpCodes.Pop));
-        for (int i = 0; i < pushes2; i++)
-            fallbackReplacements.Add(il.Create(OpCodes.Ldnull));
-
-        if (fallbackReplacements.Count > 0)
-        {
-            foreach (var rep in fallbackReplacements)
-                il.InsertBefore(instr, rep);
-            il.Remove(instr);
-        }
-        else
-        {
-            // No stack effect — just replace with nop
-            il.Replace(instr, il.Create(OpCodes.Nop));
-        }
-        _stackNeutralReplacements++;
-    }
 
     /// <summary>
     /// Compute the stack delta (pops, pushes) for an instruction.
     /// This is a simplified calculation that handles the most common opcodes.
     /// For complex opcodes (call, callvirt, newobj), use the operand-specific logic
-    /// in ReplaceInstructionWithStackNeutral instead.
+    /// in IsolateDeadBlock instead.
     /// </summary>
     private static (int pops, int pushes) GetInstructionStackDelta(Instruction instr)
     {
@@ -5280,6 +5197,7 @@ class DeweaverEngine
 
                     if (isModified)
                     {
+                        PrepareMethod(method.Body);
                         // First pass: clean up dead code patterns and revert pointer math
                         // ONLY on methods the deweaver actually touched
                         deadCodeCleaned += CleanupDeadCodePatterns(method);
@@ -5313,6 +5231,8 @@ class DeweaverEngine
 
                                 balanced = ValidateMethodBodyStackBalance(method);
                             }
+
+                            FinalizeMethod(method.Body);
 
                             if (totalFixed > 0)
                             {
@@ -5973,7 +5893,7 @@ class DeweaverEngine
     /// Two-pass approach: first run BFS to collect all underflowing instructions,
     /// then apply replacements in a second pass. This avoids mutating instructions
     /// while stale references to them may still exist in the BFS work queue.
-    /// When ReplaceInstructionWithStackNeutral replaces an instruction, Cecil creates
+    /// When IsolateDeadBlock replaces an instruction, Cecil creates
     /// a new Instruction object at the same position, detaching the old one from the
     /// linked list — causing instr.Next to return null and silently cutting off BFS
     /// exploration of the successor path.
@@ -6074,7 +5994,7 @@ class DeweaverEngine
         {
             try
             {
-                ReplaceInstructionWithStackNeutral(il, instr, false);
+                il.Remove(instr);
                 patched++;
             }
             catch { }
@@ -6125,18 +6045,6 @@ class DeweaverEngine
                 }
             }
 
-            // Fusion 2: Remove [PreserveAttribute] from methods (added to OnChanged handlers in editor builds)
-            // Per weaver source (line 2830): handler.Method.CustomAttributes.Add(asm.Import(PreserveAttribute));
-            foreach (var method in type.Methods.ToList())
-            {
-                var preserveAttrs = method.CustomAttributes.Where(a =>
-                    a.AttributeType.Name == "PreserveAttribute").ToList();
-                foreach (var attr in preserveAttrs)
-                {
-                    method.CustomAttributes.Remove(attr);
-                    _removedPreserveAttrs++;
-                }
-            }
 
             // Fusion 2: Remove weaver-generated constructor calls that reference
             // NetworkBehaviourUtils.Initialize or similar Fusion 2 runtime registration.
@@ -7673,6 +7581,7 @@ class DeweaverEngine
         Console.WriteLine($"  Weaved attributes removed:      {_removedWeavedAttrs}");
         Console.WriteLine($"  [Networked] attrs ensured:      {_ensuredNetworkedAttrs}");
         Console.WriteLine($"  [Networked] metadata preserved: {_preservedNetworkedMetadata}");
+        Console.WriteLine($"  Phantom types purged:           {_purgedPhantomTypes}");
 
         Console.WriteLine($"  Ptr null checks stripped:       {_removedPtrNullChecks}");
         Console.WriteLine($"  Default fields removed:         {_removedDefaultFields}");
@@ -7727,7 +7636,6 @@ class DeweaverEngine
         Console.WriteLine($"  Setters created (get-only props): {_createdSetters}");
         Console.WriteLine($"  Orphaned Fusion._N refs found:  {_scrubbedOrphanedFusionTypeRefs}");
         Console.WriteLine($"  Cross-module refs sanitized:    {_importSanitizedRefs}");
-        Console.WriteLine($"  Stack-neutral replacements:     {_stackNeutralReplacements}");
         Console.WriteLine($"  Invalid method bodies fixed:    {_invalidMethodBodiesFixed}");
         Console.WriteLine($"  Stack merge points fixed:       {_stackMergeFixes}");
         Console.WriteLine($"  Dead branches resolved:         {_deadBranchesFixed}");
@@ -7746,7 +7654,7 @@ class DeweaverEngine
     /// branches (always-true/false from Ldnull comparisons), and aggressively
     /// cleans dead push+pop sequences that the decompiler renders as "_ = expr;".
     ///
-    /// These issues are caused by ReplaceInstructionWithStackNeutral creating
+    /// These issues are caused by IsolateDeadBlock creating
     /// Pop+Ldnull sequences that produce inconsistent stack depths at branch
     /// merge points, and by earlier cleanup steps leaving dead instruction pairs.
     /// </summary>
@@ -7776,6 +7684,7 @@ class DeweaverEngine
                     if (!WasMethodModifiedByDeweaver(method))
                         continue;
 
+                    PrepareMethod(method.Body);
                     bool changed = true;
                     int rounds = 0;
                     while (changed && rounds < 5)
@@ -7790,6 +7699,7 @@ class DeweaverEngine
                         if (fix1 + fix2 + fix3 > 0)
                             changed = true;
                     }
+                    FinalizeMethod(method.Body);
                     if (rounds > 1) methodsProcessed++;
                 }
                 catch { }
@@ -7807,7 +7717,7 @@ class DeweaverEngine
     /// Strategy: Run full BFS stack simulation. At each instruction reachable from
     /// multiple paths, check if all incoming stack depths are the same. If not,
     /// insert Pop instructions on paths with excess values (these are Ldnull artifacts
-    /// from ReplaceInstructionWithStackNeutral) to bring all paths to the minimum depth.
+    /// from IsolateDeadBlock) to bring all paths to the minimum depth.
     /// </summary>
     private int FixStackMergeInconsistencies(MethodDefinition method)
     {
